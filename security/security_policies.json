@@ -1,0 +1,46 @@
+{
+  "_comment": "安全策略配置文件 - 第5组系统协调层",
+  "_version": "1.0.0",
+  "policies": [
+    {
+      "id": "SEC-001",
+      "name": "危险命令拦截",
+      "description": "拦截危险的系统命令，如 rm、shutdown、reboot、mkfs、dd 等",
+      "action_pattern": "\\b(rm|shutdown|reboot|mkfs|dd|format|fdisk|wipefs)\\b",
+      "target_pattern": null,
+      "risk_level": "critical",
+      "block": true,
+      "enabled": true
+    },
+    {
+      "id": "SEC-002",
+      "name": "受保护路径拦截",
+      "description": "拦截对系统关键路径的访问，如 /etc、/sys、/proc、/boot 等",
+      "action_pattern": null,
+      "target_pattern": "^/(etc|sys|proc|boot|dev|root|usr/bin|usr/sbin|sbin|bin)(/|$)",
+      "risk_level": "critical",
+      "block": true,
+      "enabled": true
+    },
+    {
+      "id": "SEC-003",
+      "name": "删除操作风险标记",
+      "description": "删除操作标记为 high 风险，需人工确认（非拦截）",
+      "action_pattern": "\\b(delete|remove|unlink|rmdir|trash)\\b",
+      "target_pattern": null,
+      "risk_level": "high",
+      "block": false,
+      "enabled": true
+    },
+    {
+      "id": "SEC-004",
+      "name": "写操作风险标记",
+      "description": "写入/修改操作标记为 medium 风险（非拦截）",
+      "action_pattern": "\\b(write|create|modify|edit|chmod|chown|mv|copy)\\b",
+      "target_pattern": null,
+      "risk_level": "medium",
+      "block": false,
+      "enabled": true
+    }
+  ]
+}
