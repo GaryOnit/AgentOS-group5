@@ -25,6 +25,7 @@ from typing import Any, Dict, Optional
 
 from group5.contracts.schemas import CheckJSON, IntentJSON, RiskLevel
 from group5.security.policies import PolicyLoader
+from group5.security.path_capabilities import normalize_linux_path
 
 
 logger = logging.getLogger(__name__)
@@ -106,9 +107,7 @@ class SecuritySandbox:
 
         例如 /home/../etc/passwd -> /etc/passwd
         """
-        if target.startswith("/") or target.startswith("./") or target.startswith("../"):
-            return os.path.normpath(target)
-        return target
+        return normalize_linux_path(target)
 
     def _max_risk(self, left: RiskLevel, right: RiskLevel) -> RiskLevel:
         """返回两个风险等级中更高的一个。"""
@@ -158,7 +157,11 @@ class SecuritySandbox:
 
         # 仅对绝对路径写操作做限制
         if action_lower in self._WRITE_ACTIONS and normalized_target.startswith("/"):
-            allowed = any(normalized_target.startswith(prefix) for prefix in self._SANDBOX_WRITE_ALLOW_PREFIX)
+            allowed = any(
+                normalized_target == prefix.rstrip("/")
+                or normalized_target.startswith(prefix)
+                for prefix in self._SANDBOX_WRITE_ALLOW_PREFIX
+            )
             if not allowed:
                 return {
                     "approved": False,
@@ -270,6 +273,18 @@ class SecuritySandbox:
         params: Dict[str, Any] = dict(intent_json.get("params", {}))
 
         normalized_target = self._normalize_path(raw_target)
+
+        # 相对路径中的父目录跳转无法可靠绑定到安全根，必须在策略匹配前
+        # 明确拒绝；绝对路径仍先规范化，再由SEC-002判断真实目标类别。
+        if not raw_target.startswith("/") and ".." in raw_target.split("/"):
+            self._blocked_count += 1
+            self._risk_score_accum += RISK_LEVEL_SCORE["critical"]
+            return {
+                "approved": False,
+                "risk_level": "critical",
+                "reason": "路径穿越拒绝：相对路径包含父目录跳转",
+                "matched_policy": "SEC-PATH-001",
+            }
 
         logger.debug(
             "安全检查: action=%s, target=%s -> normalized=%s",

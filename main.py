@@ -15,6 +15,7 @@
     python group5/main.py
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -22,6 +23,7 @@ import time
 
 # 确保项目根目录在 sys.path 中（支持 python group5/main.py 直接运行）
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_GROUP5_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
@@ -32,11 +34,17 @@ logging.basicConfig(
 )
 
 from group5.audit.audit_logger import AuditLogger
-from group5.contracts.schemas import IntentJSON, OrchestrateResult
+from group5.contracts.schemas import IntentJSON
 from group5.coordinator.system_coordinator import SystemCoordinator
 from group5.knowledge.rag_kb import RAGKnowledgeBase
-from group5.mocks.mock_modules import MockGroup2Planner, MockGroup3Executor, MockGroup4ToolRegistry
+from group5.mocks.mock_modules import (
+    MockGroup1HostAgent,
+    MockGroup2Planner,
+    MockGroup3Executor,
+    MockGroup4ToolRegistry,
+)
 from group5.security.security_sandbox import SecuritySandbox
+from group5.storage.database import SQLiteStore, resolve_database_path
 
 
 # ═══════════════════════════════════════════════════════════
@@ -52,14 +60,23 @@ def print_separator(title: str = "", width: int = 60) -> None:
         print("═" * width)
 
 
-def print_result(scenario_num: int, desc: str, result: OrchestrateResult) -> None:
-    """格式化打印编排结果"""
+def print_result(scenario_num: int, desc: str, result: dict) -> None:
+    """
+    格式化打印旧版或v1编排结果。
+
+    Args:
+        scenario_num: 演示场景编号。
+        desc: 场景说明。
+        result: 旧OrchestrateResult或v1结果字典。
+    """
     status = "✅ 成功" if result["success"] else "🚫 拦截/失败"
+    latency_ms = result.get("total_latency_ms", result.get("latency_ms", 0.0))
+    trace_id = result.get("task_trace_id", result.get("trace_id", ""))
     print(f"\n【场景{scenario_num}】{desc}")
     print(f"  状态:   {status}")
     print(f"  阶段:   {result['stage']}")
-    print(f"  耗时:   {result['latency_ms']:.1f}ms")
-    print(f"  追踪ID: {result['trace_id'][:16]}...")
+    print(f"  耗时:   {latency_ms:.1f}ms")
+    print(f"  追踪ID: {trace_id[:16]}...")
 
     if result["success"]:
         res = result.get("result") or {}
@@ -71,32 +88,126 @@ def print_result(scenario_num: int, desc: str, result: OrchestrateResult) -> Non
         print(f"  错误:   {error.get('message', 'N/A')}")
 
 
+class _DemoGroup1Adapter:
+    """将第五组旧Mock包装为第一组四字段演示契约。"""
+
+    contract_version = "1.0"
+    mode = "mock"
+
+    def __init__(self) -> None:
+        """初始化第五组旧Mock作为离线关键词后端。"""
+        self._legacy = MockGroup1HostAgent()
+
+    def understand_intent(self, user_input: str, history=None) -> dict:
+        """
+        解析演示指令并补齐第一组intent分类。
+
+        Args:
+            user_input: 当前自然语言指令。
+            history: 可选历史；旧Mock不使用该参数。
+
+        Returns:
+            符合第一组成功契约的四字段对象。
+        """
+        parsed = self._legacy.parse(user_input)
+        action = parsed["action"]
+        if action in {"open", "close", "switch"}:
+            category = "应用控制"
+        elif action in {"adjust", "enable", "disable"}:
+            category = "系统设置"
+        elif action in {"query", "check"}:
+            category = "信息查询"
+        else:
+            category = "文件操作"
+        return {
+            "intent": category,
+            "target": parsed["target"],
+            "action": action,
+            "params": dict(parsed.get("params", {})),
+        }
+
+
 # ═══════════════════════════════════════════════════════════
 # 主演示函数
 # ═══════════════════════════════════════════════════════════
 
-def run_demo() -> None:
-    """运行全部验收场景演示"""
+def _load_group1(mode: str):
+    """
+    加载第一组Mock或其真实HostAgent门面。
+
+    Args:
+        mode: mock、group1-mock或auto。
+
+    Returns:
+        可注册到第五组的第一组模块实例。
+
+    Raises:
+        RuntimeError: 第一组源码目录不存在或无法导入。
+    """
+    if mode == "mock":
+        return _DemoGroup1Adapter()
+
+    source_dir = os.getenv(
+        "GROUP1_SOURCE_DIR",
+        os.path.join(_ROOT, "ai-shell-hostagent-update-liujiyuan"),
+    )
+    if not os.path.isdir(source_dir):
+        raise RuntimeError(f"第一组源码目录不存在: {source_dir}")
+    if source_dir not in sys.path:
+        sys.path.insert(0, source_dir)
+    try:
+        from host_agent_mock import HostAgent
+    except ImportError as exc:
+        raise RuntimeError("无法导入第一组HostAgent") from exc
+    return HostAgent(mode="mock" if mode == "group1-mock" else "auto")
+
+
+def create_demo_coordinator(mode: str = "mock", database_path: str = ""):
+    """
+    创建使用独立demo数据库的协调器。
+
+    Args:
+        mode: 第一组运行模式。
+        database_path: 可选demo数据库路径；为空时使用group5/data。
+
+    Returns:
+        coordinator、rag_kb和audit三元组。
+    """
+    path = database_path or resolve_database_path(
+        os.path.join(_GROUP5_ROOT, "data"),
+        "demo",
+    )
+    state_store = SQLiteStore(path, "demo")
+    rag_kb = RAGKnowledgeBase(state_store=state_store, include_mock=True)
+    audit = AuditLogger(state_store=state_store)
+    coordinator = SystemCoordinator(
+        rag_kb=rag_kb,
+        audit_logger=audit,
+        security_sandbox=SecuritySandbox(),
+        state_store=state_store,
+    )
+    coordinator.register("group1", _load_group1(mode))
+    coordinator.register("group2", MockGroup2Planner())
+    coordinator.register("group3", MockGroup3Executor())
+    coordinator.register("group4", MockGroup4ToolRegistry())
+    return coordinator, rag_kb, audit
+
+
+def run_demo(mode: str = "mock", database_path: str = "") -> None:
+    """
+    运行全部验收场景演示。
+
+    Args:
+        mode: 第一组运行模式。
+        database_path: 可选demo数据库路径。
+    """
     print_separator("第5组系统协调层 - 验收演示", width=64)
     print("Linux Agentic OS 课程项目（UFO² 架构适配）")
     print("组件：SystemCoordinator + SecuritySandbox + RAGKnowledgeBase + AuditLogger")
     print_separator(width=64)
 
-    # ── 初始化所有组件 ──────────────────────────────────────
-    rag_kb = RAGKnowledgeBase()
-    audit = AuditLogger()
-    security = SecuritySandbox()
-
-    coordinator = SystemCoordinator(
-        rag_kb=rag_kb,
-        audit_logger=audit,
-        security_sandbox=security,
-    )
-
-    # 注册外部模块（使用 Mock 实现，替代真实 Group2/3/4）
-    coordinator.register("group2", MockGroup2Planner())
-    coordinator.register("group3", MockGroup3Executor())
-    coordinator.register("group4", MockGroup4ToolRegistry())
+    coordinator, rag_kb, audit = create_demo_coordinator(mode, database_path)
+    print(f"运行模式：Group1={mode}，Group2/3/4=mock，environment=demo")
 
     # 健康检查
     print("\n📋 模块健康状态:")
@@ -107,6 +218,10 @@ def run_demo() -> None:
         print(f"   {mark} {name:<15} {latency}")
 
     print_separator("验收场景演示", width=64)
+
+    # 自然语言入口冒烟：Group1解析后进入与结构化场景相同的核心链路。
+    natural_result = coordinator.orchestrate_text("打开文件管理器")
+    print_result(0, "自然语言 → Group1 → Group5完整入口", natural_result)
 
     # ══════════════════════════════════════════════════════
     # 场景1：打开文件管理器（应用控制，low 风险）
@@ -282,7 +397,20 @@ def run_demo() -> None:
 
 if __name__ == "__main__":
     try:
-        run_demo()
+        parser = argparse.ArgumentParser(description="第5组系统协调层验收演示")
+        parser.add_argument(
+            "--mode",
+            choices=("mock", "group1-mock", "auto"),
+            default="mock",
+            help="第一组模式；Group2/3/4在当前仓库中仍使用Mock",
+        )
+        parser.add_argument(
+            "--database-path",
+            default="",
+            help="可选demo SQLite路径，默认写入group5/data",
+        )
+        arguments = parser.parse_args()
+        run_demo(arguments.mode, arguments.database_path)
     except KeyboardInterrupt:
         print("\n\n演示被用户中断")
         sys.exit(0)

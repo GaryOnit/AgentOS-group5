@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from group5.contracts.schemas import AuditEvent
+from group5.security.redaction import redact
+from group5.storage.database import SQLiteStore
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +43,11 @@ class AuditLogger:
     daemon 后台线程从队列中取出事件并批量写入文件（或内存列表）。
     """
 
-    def __init__(self, log_file: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        log_file: Optional[str] = None,
+        state_store: Optional[SQLiteStore] = None,
+    ) -> None:
         """
         初始化审计日志记录器
 
@@ -49,8 +55,10 @@ class AuditLogger:
             log_file: 日志文件路径（可选）。
                      若指定，事件会同步到该文件（JSON Lines 格式）。
                      若为 None，则纯内存模式（适合测试）。
+            state_store: 可选SQLite事实存储；指定后事件同时写入audit_events表。
         """
         self._log_file = log_file
+        self._state_store = state_store
         self._queue: queue.Queue = queue.Queue()        # 内存事件队列
         self._events: List[AuditEvent] = []             # 内存事件列表（用于查询）
         self._lock = threading.Lock()                    # 保护 _events 列表的锁
@@ -87,13 +95,17 @@ class AuditLogger:
             生成的事件 ID（UUID 格式）
         """
         event_id = str(uuid.uuid4())
+        # 脱敏必须发生在事件进入队列之前，确保内存、SQLite和JSONL不会
+        # 短暂持有可通过查询读出的秘密。
+        safe_payload = redact(payload or {})
+        safe_message = redact(message)
         event: AuditEvent = {
             "event_id": event_id,
             "trace_id": trace_id,
             "event_type": event_type,
             "level": level.upper(),
-            "message": message,
-            "payload": payload or {},
+            "message": str(safe_message),
+            "payload": safe_payload,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         # 非阻塞放入队列（put_nowait 在队列满时抛异常，put 会阻塞）
@@ -129,6 +141,10 @@ class AuditLogger:
 
             if batch:
                 self._persist_batch(batch)
+                # queue.task_done()必须在内存和持久化尝试结束后调用，flush()
+                # 才能区分“已被工作线程取走”和“已经真正处理完成”。
+                for _ in batch:
+                    self._queue.task_done()
 
             if not batch:
                 # 队列为空时短暂休眠，避免 CPU 空转
@@ -155,6 +171,15 @@ class AuditLogger:
             except OSError as exc:
                 logger.error("审计日志写入文件失败: %s", exc)
 
+        if self._state_store is not None:
+            for event in batch:
+                try:
+                    self._state_store.append_audit_event(event)
+                except Exception as exc:
+                    # SQLite异常不应丢失内存事件，但健康检查会显示队列和
+                    # 当前持久化数量，便于调用方发现持久层不一致。
+                    logger.error("审计日志写入SQLite失败: %s", exc)
+
     def flush(self, timeout: float = 2.0) -> None:
         """
         等待队列清空（用于测试和优雅关闭）
@@ -163,8 +188,10 @@ class AuditLogger:
             timeout: 最大等待时间（秒）
         """
         start = time.time()
-        while not self._queue.empty() and (time.time() - start) < timeout:
+        while self._queue.unfinished_tasks > 0 and (time.time() - start) < timeout:
             time.sleep(0.01)
+        if self._queue.unfinished_tasks == 0:
+            return
         # 强制消费剩余事件
         batch: List[AuditEvent] = []
         try:
@@ -175,6 +202,8 @@ class AuditLogger:
             pass
         if batch:
             self._persist_batch(batch)
+            for _ in batch:
+                self._queue.task_done()
 
     def shutdown(self, wait: bool = True) -> None:
         """
@@ -199,6 +228,8 @@ class AuditLogger:
         Returns:
             匹配的审计事件列表（按时间戳排序）
         """
+        if self._state_store is not None:
+            return self._state_store.query_audit_by_trace_id(trace_id)
         with self._lock:
             matched = [e for e in self._events if e.get("trace_id") == trace_id]
         return sorted(matched, key=lambda e: e.get("timestamp", ""))
@@ -220,6 +251,8 @@ class AuditLogger:
         Returns:
             事件数量
         """
+        if self._state_store is not None:
+            return self._state_store.audit_count()
         with self._lock:
             return len(self._events)
 

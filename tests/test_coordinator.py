@@ -139,15 +139,16 @@ class TestSystemCoordinator(unittest.TestCase):
         """
         测试4：慢模块触发 E5002
 
-        注册阻塞 4 秒的慢速 Planner，超过 3s 超时阈值，
+        为 Planner 注入短超时阈值并注册慢速实现，
         应返回 E5002 超时错误。
         """
         coord = SystemCoordinator(
             rag_kb=RAGKnowledgeBase(),
             audit_logger=AuditLogger(),
+            stage_timeouts={"planning": 0.05},
         )
-        # 注册阻塞 4s 的慢速 Planner（超过 3s 阈值）
-        coord.register("group2", SlowMockGroup2Planner(sleep_seconds=4.0))
+        # 使用短测试阈值验证超时，不让单元测试真实等待默认15秒。
+        coord.register("group2", SlowMockGroup2Planner(sleep_seconds=0.2))
         coord.register("group3", MockGroup3Executor())
 
         intent = _make_intent("open", "/home/user", trace_id="timeout-001")
@@ -161,8 +162,8 @@ class TestSystemCoordinator(unittest.TestCase):
             result["error"]["code"], ErrorCode.E5002.value,  # type: ignore[index]
             "超时应返回 E5002"
         )
-        # 超时控制应在约 3s 内失败（允许 1s 误差）
-        self.assertLess(elapsed, 5.0, f"超时控制耗时不应超过 5s，实际: {elapsed:.1f}s")
+        # 注入50ms阈值后应快速失败，证明测试不依赖硬编码默认值。
+        self.assertLess(elapsed, 1.0, f"超时控制应快速返回，实际: {elapsed:.1f}s")
 
         coord.shutdown(wait=False)
 

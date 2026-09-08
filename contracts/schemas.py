@@ -11,8 +11,38 @@ from typing import Any, Dict, List, Literal, Optional, TypedDict
 # 风险等级类型，从低到高
 RiskLevel = Literal["low", "medium", "high", "critical"]
 
-# 流程阶段类型，包含安全检查、规划、执行、工具调用、完成
-Stage = Literal["security", "planning", "execution", "tool_call", "completed"]
+# 流程阶段类型。保留旧的 tool_call 名称，并补充 v1 编排状态机需要的阶段，
+# 使旧结果仍可被读取，新流程也能精确标识意图、检测和持久化失败。
+Stage = Literal[
+    "intent",
+    "security",
+    "planning",
+    "detection",
+    "execution",
+    "tool_authorization",
+    "tool_execution",
+    "tool_call",
+    "persistence",
+    "completed",
+]
+
+# v1 编排结果状态。暂停状态与失败状态分开，调用方可据此决定追问、确认、
+# 恢复或结束任务，而不需要解析自然语言错误消息。
+OrchestrationStatus = Literal[
+    "running",
+    "completed",
+    "failed",
+    "needs_input",
+    "needs_confirmation",
+    "needs_redetection",
+    "tool_required",
+    "cancelled",
+    "cancelled_with_side_effects",
+    "partial_failure",
+]
+
+# 当前标准契约版本。后续不兼容变更必须提升版本，不能静默改变 v1 字段语义。
+CONTRACT_VERSION_V1 = "1.0"
 
 
 class IntentJSON(TypedDict):
@@ -31,6 +61,150 @@ class IntentJSON(TypedDict):
     target: str             # 操作目标
     params: Dict[str, Any]  # 额外参数
     raw_text: str           # 原始用户输入
+
+
+class IntentPayloadV1(TypedDict):
+    """
+    v1 标准意图载荷。
+
+    字段说明：
+        category: 第一组返回的意图分类，如“应用控制”“文件操作”。
+        action: 规范化动作，如 open、move、create。
+        target: 操作目标实体或路径。
+        params: 与动作相关的结构化参数。
+        raw_text: 当前任务对应的原始用户指令。
+    """
+    category: str
+    action: str
+    target: str
+    params: Dict[str, Any]
+    raw_text: str
+
+
+class TaskEnvelopeV1(TypedDict):
+    """
+    第五组内部使用的 v1 任务信封。
+
+    第一组无需返回这些系统字段；第五组集成入口负责在调用第一组前生成
+    task_trace_id 和 attempt_id，并在解析成功后补齐意图载荷。
+    """
+    contract_version: str
+    task_trace_id: str
+    attempt_id: str
+    timestamp: str
+    intent: IntentPayloadV1
+
+
+class PlanningRequestV1(TypedDict):
+    """第五组提交给第二组规划能力的 v1 请求。"""
+    contract_version: str
+    task_trace_id: str
+    attempt_id: str
+    intent: IntentPayloadV1
+    retrieval_context: List[Dict[str, Any]]
+
+
+class PlanResultV1(TypedDict):
+    """第二组规划结果的标准化视图。"""
+    contract_version: str
+    task_trace_id: str
+    plan_id: str
+    steps: List[Dict[str, Any]]
+    metadata: Dict[str, Any]
+
+
+class DetectionRequestV1(TypedDict):
+    """第五组提交给第二组控件检测能力的 v1 请求。"""
+    contract_version: str
+    task_trace_id: str
+    attempt_id: str
+    plan: PlanResultV1
+
+
+class DetectionResultV1(TypedDict):
+    """控件检测的标准化结果；degraded 表示外组尚未提供检测能力。"""
+    contract_version: str
+    task_trace_id: str
+    status: str
+    elements: Any
+    metadata: Dict[str, Any]
+
+
+class ExecutionRequestV1(TypedDict):
+    """第五组提交给第三组的可恢复整计划执行请求。"""
+    contract_version: str
+    task_trace_id: str
+    attempt_id: str
+    plan: PlanResultV1
+    detection: DetectionResultV1
+    checkpoint: Optional[str]
+    tool_result: Optional[Dict[str, Any]]
+
+
+class ExecutionResultV1(TypedDict):
+    """第三组执行结果的标准化视图。"""
+    contract_version: str
+    task_trace_id: str
+    status: str
+    completed_step_ids: List[str]
+    failed_step_id: Optional[str]
+    checkpoint: Optional[str]
+    output: Optional[Any]
+    tool_request: Optional[Dict[str, Any]]
+    metadata: Dict[str, Any]
+
+
+class ToolRequestV1(TypedDict):
+    """第三组提交给第五组的结构化工具请求。"""
+    contract_version: str
+    task_trace_id: str
+    attempt_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments: Dict[str, Any]
+
+
+class ToolResultV1(TypedDict):
+    """第五组调用第四组后返回给第三组的标准工具结果。"""
+    contract_version: str
+    task_trace_id: str
+    tool_call_id: str
+    success: bool
+    output: Optional[Any]
+    error: Optional[Dict[str, Any]]
+
+
+class StageSummaryV1(TypedDict):
+    """对外可见的精简阶段摘要，不包含模型提示词或工具敏感载荷。"""
+    name: Stage
+    status: str
+    latency_ms: float
+    attempts: int
+
+
+class ErrorDetailV1(TypedDict, total=False):
+    """v1 统一错误对象；cause 用于保留经过脱敏的上游原始错误。"""
+    code: str
+    message: str
+    retryable: bool
+    detail: str
+    hint: str
+    missing_fields: List[str]
+    cause: Dict[str, Any]
+
+
+class OrchestrateResultV1(TypedDict):
+    """v1 编排结果，支持成功、失败和需要用户操作的暂停状态。"""
+    contract_version: str
+    success: bool
+    status: OrchestrationStatus
+    task_trace_id: str
+    attempt_id: str
+    stage: Stage
+    total_latency_ms: float
+    stages: List[StageSummaryV1]
+    result: Optional[Any]
+    error: Optional[ErrorDetailV1]
 
 
 class CheckJSON(TypedDict):

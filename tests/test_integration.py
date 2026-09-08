@@ -214,6 +214,9 @@ class TestIntegration(unittest.TestCase):
         )
         coord.register("group2", MockGroup2Planner())
         coord.register("group3", MockGroup3Executor())
+        # 本用例只验证安全模块降级；MockGroup3会请求file_manager工具，
+        # 因此仍需注册Group4，避免把工具缺失误当作安全降级失败。
+        coord.register("group4", MockGroup4ToolRegistry())
 
         # 即使是危险操作，降级沙箱也应放行（继续到规划/执行）
         intent = _make_intent("rm", "-rf /", "degraded-001", "降级模式测试")
